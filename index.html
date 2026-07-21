@@ -34,13 +34,30 @@
   .detail td.ku{ background:#f7f9fb; font-weight:600; width:16%; }
   .detail td.item{ width:22%; }
   .detail td.note{ width:24%; color:#444; }
+  /* 行の除外ボタン（画面のみ・Word/印刷には出ない） */
+  .detail td.rowact{ border:none; background:none; padding:0 0 0 6px; width:26px; }
+  .detail td.rowact button{ border:1px solid #d5d9de; background:#fff; color:#999; border-radius:4px;
+                            padding:1px 5px; font-size:11px; line-height:1.3; cursor:pointer; opacity:0; }
+  .detail tr:hover td.rowact button{ opacity:1; }
+  .detail td.rowact button:hover{ border-color:#c33; color:#c33; }
+  /* 除外パネル */
+  #excluded{ margin:0 20px 12px; background:#fff; border:1px solid var(--line); border-radius:8px; padding:12px 16px; }
+  #excluded .ex-h{ font-size:13px; font-weight:700; margin-bottom:8px; }
+  #excluded .ex-note{ font-weight:normal; color:#777; font-size:11.5px; margin-left:8px; }
+  #exlist{ list-style:none; margin:0; padding:0; display:flex; flex-wrap:wrap; gap:6px; }
+  #exlist li{ font-size:12px; background:#f5f6f8; border:1px solid #e3e6ea; border-radius:14px;
+              padding:4px 8px 4px 12px; display:flex; align-items:center; gap:6px; }
+  #exlist .ex-ku{ color:#888; }
+  #exlist .ex-why{ color:#a06000; background:#fff6e0; border-radius:8px; padding:1px 6px; font-size:11px; }
+  #exlist button{ border:1px solid var(--accent); background:#fff; color:var(--accent);
+                  border-radius:10px; padding:1px 8px; font-size:11px; cursor:pointer; }
   [contenteditable]{ outline:none; }
   [contenteditable]:focus{ background:#fffbe6; }
 </style>
 </head>
 <body>
 <header class="app">
-  <h1>見積書 → 工事内容概要書 変換 <span id="ver" style="font-weight:normal;font-size:11px;color:#888">v1.1</span></h1>
+  <h1>見積書 → 工事内容概要書 変換 <span id="ver" style="font-weight:normal;font-size:11px;color:#888">v1.2</span></h1>
   <p>見積書PDFを読み込むと、金額・単価・諸経費を除いた工事内容概要書に変換し、Wordファイルとして書き出します。処理はこの画面内だけで完結し、PDFは外部に送信されません。</p>
   <div class="toolbar no-print">
     <button class="ghost" id="pick">PDFを選択</button>
@@ -53,6 +70,13 @@
 <div id="drop">ここに見積書PDFをドラッグ＆ドロップ　または「PDFを選択」</div>
 <div id="status"></div>
 
+<div id="excluded" class="no-print" style="display:none">
+  <div class="ex-h">除外した項目（<span id="excount">0</span>件）
+    <span class="ex-note">管理・経費・値引き系と判定した行です。Wordには出力されません。誤りがあれば「戻す」で復活できます。</span>
+  </div>
+  <ul id="exlist"></ul>
+</div>
+
 <div id="paper" class="hidden">
   <div class="doc-title">工 事 内 容 概 要 書</div>
   <div class="doc-sub" id="docsub" contenteditable></div>
@@ -62,7 +86,7 @@
 
   <div class="sec-h">■ 工事内容詳細</div>
   <table class="detail">
-    <thead><tr><th style="width:16%">大項目</th><th style="width:22%">小項目</th><th style="width:38%">概要・摘要</th><th style="width:24%">備考</th></tr></thead>
+    <thead><tr><th style="width:16%">大項目</th><th style="width:22%">小項目</th><th style="width:38%">概要・摘要</th><th style="width:24%">備考</th><th class="no-word" style="border:none;background:none"></th></tr></thead>
     <tbody id="detail"></tbody>
   </table>
 </div>
@@ -81,7 +105,28 @@ const COLS = [
   ["note",  680, 900],
 ];
 function colOf(x){ for(const [n,a,b] of COLS){ if(x>=a && x<b) return n; } return x<50?"item":"note"; }
-const SKIP_MAJOR = new Set(["その他","値引き","内訳総括表"]);
+// ===== 除外ルール（管理・経費・値引き系）=====
+// 見積書によって工種名が違うため、完全一致ではなくキーワードで判定する。
+// 大項目だけでなく明細1行ずつも判定し、他工種に紛れ込んだ経費行も拾う。
+const EXCLUDE_RULES = [
+  {re: /値引|出精|調整額/,                 label: "値引き"},
+  {re: /法定福利|労災|保険料|安全協力/,      label: "法定福利費"},
+  {re: /現場管理|一般管理|管理費/,          label: "管理費"},
+  {re: /諸経費|経費/,                      label: "経費"},
+  {re: /駐車場/,                          label: "駐車場代"},
+];
+// 集計用の見出しなど、明細ではない大項目
+const SKIP_MAJOR_RE = /^(内訳|総括|内訳総括表|合計|小計)/;
+
+function matchRule(text){
+  for(const r of EXCLUDE_RULES) if(r.re.test(text||"")) return r.label;
+  return null;
+}
+// 大項目そのものが経費・値引き系か（「その他」は工種名としては経費扱い）
+function majorExcluded(major){
+  if(major === "その他") return "経費・その他";
+  return matchRule(major);
+}
 
 const $ = s => document.querySelector(s);
 const status = m => $("#status").textContent = m || "";
@@ -133,11 +178,11 @@ function parseSections(pages){
       if(full.startsWith("■")){ major = full.slice(1).split("¥")[0].trim(); continue; }
       if(first.startsWith("【")){
         const sub = full.slice(full.indexOf("【")+1, full.indexOf("】"));
-        if(major && !SKIP_MAJOR.has(major)){ rows=[]; sections.push({major,sub,rows}); }
+        if(major && !SKIP_MAJOR_RE.test(major)){ rows=[]; sections.push({major,sub,rows}); }
         else rows=null;
         continue;
       }
-      if(major===null || SKIP_MAJOR.has(major) || rows===null) continue;
+      if(major===null || SKIP_MAJOR_RE.test(major) || rows===null) continue;
       if(full.startsWith("[小") || full.startsWith("No") || full.includes("規格")) continue;
       if(/^\d+\s*\/\s*\d+$/.test(full)) continue;          // ページ番号
       if(/^¥?[\d,]+$/.test(full)) continue;                // 単独金額
@@ -177,6 +222,93 @@ function specText({spec,qty,unit}){
 // ---- 備考欄（見積書の備考をそのまま転記。金額表現のみ除去） ----
 function noteText({note}){ return scrubMoney(note); }
 
+// ===== 表示モデル =====
+// ROWS: 明細を1行ずつ平坦に持つ。除外はここに excluded フラグを立てるだけで、
+// データ自体は消さない（画面から戻せるようにするため）。
+let ROWS = [];
+
+function buildModel(sections){
+  ROWS = [];
+  sections.forEach((sec, secIdx) => {
+    const ku = sec.sub && sec.sub!==sec.major ? `${sec.major}（${sec.sub}）` : sec.major;
+    const majorHit = majorExcluded(sec.major);
+    sec.rows.forEach(r => {
+      const hit = majorHit || matchRule(r.item) || matchRule(r.spec);
+      ROWS.push({
+        secIdx, ku, item: r.item||"", spec: specText(r), note: noteText(r),
+        excluded: !!hit,
+        reason: hit ? (majorHit ? `大項目「${sec.major}」が${hit}` : `${hit}に該当`) : "",
+      });
+    });
+  });
+}
+
+// 表示中の編集内容をモデルに書き戻す（再描画で消えないように）
+function syncFromDom(){
+  for(const tr of $("#detail").querySelectorAll("tr[data-idx]")){
+    const row = ROWS[+tr.dataset.idx]; if(!row) continue;
+    const ku = tr.querySelector("td.ku");
+    if(ku){ const v = ku.textContent.trim();
+            ROWS.forEach(r => { if(r.secIdx===row.secIdx) r.ku = v; }); }
+    row.item = tr.querySelector('[data-f="item"]').textContent.trim();
+    row.spec = tr.querySelector('[data-f="spec"]').textContent.trim();
+    row.note = tr.querySelector('[data-f="note"]').textContent.trim();
+  }
+}
+
+function toggleExclude(idx){
+  syncFromDom();
+  ROWS[idx].excluded = !ROWS[idx].excluded;
+  if(!ROWS[idx].excluded) ROWS[idx].reason = "";
+  renderDetail();
+}
+
+// ---- 明細表と除外パネルの描画 ----
+function renderDetail(){
+  const tb = $("#detail"); tb.innerHTML="";
+  const visible = ROWS.map((r,i)=>({r,i})).filter(x=>!x.r.excluded);
+  // 連続する同一セクションをまとめてセル結合
+  let g=0;
+  while(g < visible.length){
+    let n=1;
+    while(g+n < visible.length && visible[g+n].r.secIdx === visible[g].r.secIdx) n++;
+    for(let k=0;k<n;k++){
+      const {r,i} = visible[g+k];
+      const tr = document.createElement("tr");
+      tr.dataset.idx = i;
+      const kuCell = k===0 ? `<td class="ku" rowspan="${n}" contenteditable>${r.ku}</td>` : "";
+      tr.innerHTML = `${kuCell}`
+        + `<td class="item" data-f="item" contenteditable>${r.item}</td>`
+        + `<td data-f="spec" contenteditable>${r.spec}</td>`
+        + `<td class="note" data-f="note" contenteditable>${r.note}</td>`
+        + `<td class="rowact no-word"><button type="button" title="この行を除外">×</button></td>`;
+      tr.querySelector(".rowact button").onclick = ()=> toggleExclude(i);
+      tb.appendChild(tr);
+    }
+    g += n;
+  }
+  renderExcluded();
+}
+
+// ---- 除外した項目の一覧（Wordには出力されない） ----
+function renderExcluded(){
+  const box = $("#excluded"), list = $("#exlist");
+  const ex = ROWS.map((r,i)=>({r,i})).filter(x=>x.r.excluded);
+  if(!ex.length){ box.style.display="none"; return; }
+  box.style.display="";
+  $("#excount").textContent = ex.length;
+  list.innerHTML = "";
+  for(const {r,i} of ex){
+    const li = document.createElement("li");
+    li.innerHTML = `<span class="ex-ku">${r.ku}</span> <b>${r.item||"(名称なし)"}</b>`
+                 + `<span class="ex-why">${r.reason||"手動で除外"}</span> `;
+    const b = document.createElement("button");
+    b.type="button"; b.textContent="戻す"; b.onclick = ()=> toggleExclude(i);
+    li.appendChild(b);
+    list.appendChild(li);
+  }
+}
+
 // ---- プレビュー描画 ----
 function render(header, sections){
   const kenmei = header.name || "リフォーム工事";
@@ -186,34 +318,21 @@ function render(header, sections){
     ["工事場所", header.place],
   ].map(([l,v])=>
     `<tr><td class="lbl">${l}</td><td contenteditable style="white-space:pre-line">${v||""}</td></tr>`).join("");
-
-  const tb = $("#detail"); tb.innerHTML="";
-  for(const sec of sections){
-    const ku = sec.sub && sec.sub!==sec.major ? `${sec.major}（${sec.sub}）` : sec.major;
-    sec.rows.forEach((r,i)=>{
-      const tr=document.createElement("tr");
-      const kuCell = i===0 ? `<td class="ku" rowspan="${sec.rows.length}" contenteditable>${ku}</td>` : "";
-      tr.innerHTML = `${kuCell}<td class="item" contenteditable>${r.item||""}</td>`
-                   + `<td contenteditable>${specText(r)}</td>`
-                   + `<td class="note" contenteditable>${noteText(r)}</td>`;
-      tb.appendChild(tr);
-    });
-  }
+  buildModel(sections);
+  renderDetail();
 }
 
-// ---- プレビューの現在の内容を読み直す（手修正を反映） ----
+// ---- Word出力用にデータを取り出す（手修正を反映・除外行は含めない） ----
 function collect(){
+  syncFromDom();
   const ovRows = [...$("#overview").querySelectorAll("tr")]
     .map(tr => [...tr.children].map(td => td.textContent.trim()));
   const groups = [];
-  for(const tr of $("#detail").querySelectorAll("tr")){
-    const tds = [...tr.children];
-    const off = tds[0].classList.contains("ku") ? 1 : 0;
-    if(off){ groups.push({ku: tds[0].textContent.trim(), rows: []}); }
-    if(!groups.length) continue;
-    groups[groups.length-1].rows.push([
-      tds[off].textContent.trim(), tds[off+1].textContent.trim(), tds[off+2].textContent.trim()
-    ]);
+  let prev = null;
+  for(const r of ROWS){
+    if(r.excluded) continue;
+    if(!groups.length || r.secIdx !== prev){ groups.push({ku: r.ku, rows: []}); prev = r.secIdx; }
+    groups[groups.length-1].rows.push([r.item, r.spec, r.note]);
   }
   return { title: $("#docsub").textContent.trim(), overview: ovRows, groups };
 }
