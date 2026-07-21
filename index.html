@@ -1,0 +1,322 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>見積書 → 工事内容概要書 変換</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/docx@8.5.0/build/index.umd.js"></script>
+<style>
+  :root{ --ink:#1a1a1a; --line:#cfcfcf; --accent:#2a5d8f; --bg:#f4f5f7; }
+  *{ box-sizing:border-box; }
+  body{ font-family:"Hiragino Kaku Gothic ProN","Yu Gothic",Meiryo,sans-serif; color:var(--ink); background:var(--bg); margin:0; }
+  header.app{ background:#fff; border-bottom:1px solid var(--line); padding:14px 20px; position:sticky; top:0; z-index:5; }
+  header.app h1{ font-size:16px; margin:0; }
+  header.app p{ margin:4px 0 0; font-size:12px; color:#666; }
+  .toolbar{ display:flex; gap:10px; align-items:center; flex-wrap:wrap; margin-top:10px; }
+  button{ font:inherit; padding:8px 16px; border:1px solid var(--accent); background:var(--accent); color:#fff; border-radius:6px; cursor:pointer; }
+  button.ghost{ background:#fff; color:var(--accent); }
+  button:disabled{ opacity:.4; cursor:default; }
+  #drop{ margin:20px; padding:40px; border:2px dashed #b5bcc4; border-radius:10px; text-align:center; color:#556; background:#fff; cursor:pointer; }
+  #drop.over{ border-color:var(--accent); background:#eef4fb; }
+  #status{ margin:0 20px; font-size:13px; color:#a33; min-height:18px; }
+  /* ===== 概要書プレビュー ===== */
+  #paper{ background:#fff; width:210mm; margin:20px auto; padding:18mm 16mm; box-shadow:0 2px 12px rgba(0,0,0,.12); }
+  #paper.hidden{ display:none; }
+  .doc-title{ text-align:center; font-size:22px; letter-spacing:6px; font-weight:700; margin:0 0 4px; }
+  .doc-sub{ text-align:center; font-size:14px; margin:0 0 22px; color:#333; }
+  .sec-h{ font-size:14px; font-weight:700; border-left:5px solid var(--accent); padding-left:8px; margin:20px 0 8px; }
+  table{ width:100%; border-collapse:collapse; font-size:12.5px; }
+  .overview td{ border:1px solid var(--line); padding:6px 10px; }
+  .overview td.lbl{ background:#f0f3f6; width:26%; font-weight:600; white-space:nowrap; }
+  .detail th{ border:1px solid #999; background:#eef2f6; padding:7px 8px; font-size:12.5px; }
+  .detail td{ border:1px solid var(--line); padding:6px 8px; vertical-align:top; }
+  .detail td.ku{ background:#f7f9fb; font-weight:600; width:16%; }
+  .detail td.item{ width:22%; }
+  .detail td.note{ width:24%; color:#444; }
+  [contenteditable]{ outline:none; }
+  [contenteditable]:focus{ background:#fffbe6; }
+</style>
+</head>
+<body>
+<header class="app">
+  <h1>見積書 → 工事内容概要書 変換</h1>
+  <p>見積書PDFを読み込むと、金額・単価・諸経費を除いた工事内容概要書に変換し、Wordファイルとして書き出します。処理はこの画面内だけで完結し、PDFは外部に送信されません。</p>
+  <div class="toolbar no-print">
+    <button class="ghost" id="pick">PDFを選択</button>
+    <button id="word" disabled>Wordでダウンロード</button>
+    <span style="font-size:12px;color:#666">※ 下の表はここで直接修正できます（修正はWordにも反映されます）</span>
+    <input type="file" id="file" accept="application/pdf" hidden>
+  </div>
+</header>
+
+<div id="drop">ここに見積書PDFをドラッグ＆ドロップ　または「PDFを選択」</div>
+<div id="status"></div>
+
+<div id="paper" class="hidden">
+  <div class="doc-title">工 事 内 容 概 要 書</div>
+  <div class="doc-sub" id="docsub" contenteditable></div>
+
+  <div class="sec-h">■ 工事概要</div>
+  <table class="overview"><tbody id="overview"></tbody></table>
+
+  <div class="sec-h">■ 工事内容詳細</div>
+  <table class="detail">
+    <thead><tr><th style="width:16%">大項目</th><th style="width:22%">小項目</th><th style="width:38%">概要・摘要</th><th style="width:24%">備考</th></tr></thead>
+    <tbody id="detail"></tbody>
+  </table>
+</div>
+
+<script>
+pdfjsLib.GlobalWorkerOptions.workerSrc = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
+
+// ===== 列境界（見積書テンプレートのx座標。数値は見積書PDFで実測） =====
+const COLS = [
+  ["item",   50, 260],
+  ["spec",  260, 430],
+  ["qty",   430, 470],
+  ["unit",  470, 520],
+  ["price", 520, 610],
+  ["amount",610, 680],
+  ["note",  680, 900],
+];
+function colOf(x){ for(const [n,a,b] of COLS){ if(x>=a && x<b) return n; } return x<50?"item":"note"; }
+const SKIP_MAJOR = new Set(["その他","値引き","内訳総括表"]);
+
+const $ = s => document.querySelector(s);
+const status = m => $("#status").textContent = m || "";
+
+// ---- PDFからテキスト＋座標を行単位で取り出す ----
+async function readRows(file){
+  const buf = await file.arrayBuffer();
+  const pdf = await pdfjsLib.getDocument({data:buf}).promise;
+  const pages = [];
+  for(let p=1; p<=pdf.numPages; p++){
+    const page = await pdf.getPage(p);
+    const tc = await page.getTextContent();
+    const items = [];
+    for(const it of tc.items){
+      const t = it.str; if(!t.trim()) continue;
+      items.push({x: it.transform[4], y: it.transform[5], t});
+    }
+    // yで降順ソートし、隣接（3.5pt以内）を同一行にクラスタリング
+    items.sort((a,b)=> b.y - a.y);
+    const rows=[]; let cur=null, lastY=null;
+    for(const it of items){
+      if(lastY===null || (lastY - it.y) > 3.5){ cur=[]; rows.push(cur); }
+      cur.push([it.x, it.t]); lastY = it.y;
+    }
+    rows.forEach(r=> r.sort((a,b)=>a[0]-b[0]));
+    pages.push(rows);
+  }
+  return pages;
+}
+
+// ---- 1ページ目からヘッダ情報を抽出 ----
+function parseHeader(pages){
+  const h = {name:"", place:""};
+  const lines = pages[0].map(r => r.map(c=>c[1]).join(""));
+  for(const ln of lines){
+    if(/^件\s*名/.test(ln)) h.name = ln.replace(/^件\s*名/,"").trim();
+    else if(/^現場住所/.test(ln)) h.place = ln.replace(/^現場住所/,"").trim();
+  }
+  return h;
+}
+
+// ---- 明細を工種構造に変換 ----
+function parseSections(pages){
+  const sections=[]; let major=null, rows=null;
+  for(const page of pages){
+    for(const cells of page){
+      const full = cells.map(c=>c[1]).join("");
+      const first = cells[0][1];
+      if(full.startsWith("■")){ major = full.slice(1).split("¥")[0].trim(); continue; }
+      if(first.startsWith("【")){
+        const sub = full.slice(full.indexOf("【")+1, full.indexOf("】"));
+        if(major && !SKIP_MAJOR.has(major)){ rows=[]; sections.push({major,sub,rows}); }
+        else rows=null;
+        continue;
+      }
+      if(major===null || SKIP_MAJOR.has(major) || rows===null) continue;
+      if(full.startsWith("[小") || full.startsWith("No") || full.includes("規格")) continue;
+      if(/^\d+\s*\/\s*\d+$/.test(full)) continue;          // ページ番号
+      if(/^¥?[\d,]+$/.test(full)) continue;                // 単独金額
+      // 列に振り分け
+      const col={item:[],spec:[],qty:[],unit:[],note:[]};
+      for(const [x,t] of cells){ const c=colOf(x); if(col[c]) col[c].push(t); }
+      let item = col.item.join("").replace(/^\d+\s*/,"");
+      const spec = col.spec.join(""), note = col.note.join("");
+      // 列境界で「18ケー｜ス」のように割れるため、数量＋単位を連結し直してから分割
+      const qu = (col.qty.join("") + col.unit.join("")).trim();
+      const m = qu.match(/^([\d.,]+)\s*(.*)$/);
+      const qty = m ? m[1] : "", unit = m ? m[2].trim() : qu;
+      if(!item && !spec) continue;
+      rows.push({item,spec,qty,unit,note});
+    }
+  }
+  return sections;
+}
+
+// ---- 金額表現の除去（現場向け＝原価情報は載せない） ----
+function scrubMoney(s){
+  return (s||"")
+    .replace(/[（(]?\s*(定価|上代|参考価格|税抜|税込)\s*[:：]?\s*[¥￥]?[\d,]+\s*円?\s*[)）]?/g, "")
+    .replace(/[¥￥][\d,]+/g, "")
+    .replace(/[\d,]+\s*円/g, "")
+    .replace(/\s{2,}/g, " ").replace(/^[\s　、,]+|[\s　、,]+$/g, "");
+}
+
+// ---- 概要・摘要欄（規格・摘要＋数量。数量は「一式」以外のみ記載） ----
+function specText({spec,qty,unit}){
+  const p=[];
+  const s = scrubMoney(spec);
+  if(s) p.push(s);
+  if(qty && unit && unit !== "式") p.push(qty+unit);
+  return p.join("　");
+}
+// ---- 備考欄（見積書の備考をそのまま転記。金額表現のみ除去） ----
+function noteText({note}){ return scrubMoney(note); }
+
+// ---- プレビュー描画 ----
+function render(header, sections){
+  const kenmei = header.name || "リフォーム工事";
+  $("#docsub").textContent = kenmei;
+  $("#overview").innerHTML = [
+    ["工事名称", kenmei],
+    ["工事場所", header.place],
+  ].map(([l,v])=>
+    `<tr><td class="lbl">${l}</td><td contenteditable style="white-space:pre-line">${v||""}</td></tr>`).join("");
+
+  const tb = $("#detail"); tb.innerHTML="";
+  for(const sec of sections){
+    const ku = sec.sub && sec.sub!==sec.major ? `${sec.major}（${sec.sub}）` : sec.major;
+    sec.rows.forEach((r,i)=>{
+      const tr=document.createElement("tr");
+      const kuCell = i===0 ? `<td class="ku" rowspan="${sec.rows.length}" contenteditable>${ku}</td>` : "";
+      tr.innerHTML = `${kuCell}<td class="item" contenteditable>${r.item||""}</td>`
+                   + `<td contenteditable>${specText(r)}</td>`
+                   + `<td class="note" contenteditable>${noteText(r)}</td>`;
+      tb.appendChild(tr);
+    });
+  }
+}
+
+// ---- プレビューの現在の内容を読み直す（手修正を反映） ----
+function collect(){
+  const ovRows = [...$("#overview").querySelectorAll("tr")]
+    .map(tr => [...tr.children].map(td => td.textContent.trim()));
+  const groups = [];
+  for(const tr of $("#detail").querySelectorAll("tr")){
+    const tds = [...tr.children];
+    const off = tds[0].classList.contains("ku") ? 1 : 0;
+    if(off){ groups.push({ku: tds[0].textContent.trim(), rows: []}); }
+    if(!groups.length) continue;
+    groups[groups.length-1].rows.push([
+      tds[off].textContent.trim(), tds[off+1].textContent.trim(), tds[off+2].textContent.trim()
+    ]);
+  }
+  return { title: $("#docsub").textContent.trim(), overview: ovRows, groups };
+}
+
+// ---- Word（.docx）出力 ----
+const D = window.docx;
+const FONT = "游ゴシック";
+function run(text, opt={}){ return new D.TextRun(Object.assign({text: text||"", font: FONT}, opt)); }
+function para(text, opt={}){
+  return new D.Paragraph(Object.assign({children:[run(text, opt.runOpt||{})]}, opt.paraOpt||{}));
+}
+function cell(text, opt={}){
+  return new D.TableCell({
+    width: opt.width,
+    shading: opt.shade ? {fill: opt.shade} : undefined,
+    verticalMerge: opt.merge,
+    margins: {top:60, bottom:60, left:100, right:100},
+    children: String(text||"").split("\n").map(line =>
+      new D.Paragraph({children:[run(line, {bold: !!opt.bold, size: 19})]})),
+  });
+}
+
+async function exportWord(){
+  const d = collect();
+  const pct = n => ({size: n, type: D.WidthType.PERCENTAGE});
+
+  const ovTable = new D.Table({
+    width: pct(100),
+    rows: d.overview.map(([l,v]) => new D.TableRow({children:[
+      cell(l, {width: pct(26), shade:"F0F3F6", bold:true}),
+      cell(v, {width: pct(74)}),
+    ]})),
+  });
+
+  const W = [pct(16), pct(22), pct(38), pct(24)];
+  const detailRows = [ new D.TableRow({
+    tableHeader: true,
+    children: ["大項目","小項目","概要・摘要","備考"].map((t,i)=>
+      cell(t, {width: W[i], shade:"EEF2F6", bold:true})),
+  })];
+  for(const g of d.groups){
+    g.rows.forEach(([item, spec, note], i) => {
+      detailRows.push(new D.TableRow({children:[
+        cell(i===0 ? g.ku : "", {width: W[0], shade:"F7F9FB", bold:true,
+             merge: i===0 ? D.VerticalMergeType.RESTART : D.VerticalMergeType.CONTINUE}),
+        cell(item, {width: W[1]}),
+        cell(spec, {width: W[2]}),
+        cell(note, {width: W[3]}),
+      ]}));
+    });
+  }
+  const detailTable = new D.Table({width: pct(100), rows: detailRows});
+
+  const doc = new D.Document({
+    styles:{ default:{ document:{ run:{ font: FONT, size: 20 } } } },
+    sections:[{
+      properties:{ page:{ size:{orientation: D.PageOrientation.PORTRAIT},
+                          margin:{top:1000, bottom:1000, left:900, right:900} } },
+      children:[
+        para("工 事 内 容 概 要 書", {runOpt:{bold:true, size:32}, paraOpt:{alignment: D.AlignmentType.CENTER}}),
+        para(d.title, {runOpt:{size:22}, paraOpt:{alignment: D.AlignmentType.CENTER, spacing:{after:300}}}),
+        para("■ 工事概要", {runOpt:{bold:true, size:22}, paraOpt:{spacing:{after:120}}}),
+        ovTable,
+        para("", {paraOpt:{spacing:{after:200}}}),
+        para("■ 工事内容詳細", {runOpt:{bold:true, size:22}, paraOpt:{spacing:{after:120}}}),
+        detailTable,
+      ],
+    }],
+  });
+
+  const blob = await D.Packer.toBlob(doc);
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = `工事内容概要書_${(d.title||"").replace(/[\\\/:*?"<>|]/g,"")||"無題"}.docx`;
+  a.click();
+  setTimeout(()=>URL.revokeObjectURL(a.href), 2000);
+}
+
+// ---- 実行 ----
+async function handle(file){
+  if(!file || file.type!=="application/pdf"){ status("PDFファイルを選択してください。"); return; }
+  status("読み込み中…");
+  try{
+    const pages = await readRows(file);
+    const header = parseHeader(pages);
+    const sections = parseSections(pages);
+    if(sections.length===0){ status("工事明細を検出できませんでした。見積書の書式が想定と異なる可能性があります。"); return; }
+    render(header, sections);
+    $("#paper").classList.remove("hidden");
+    $("#word").disabled=false;
+    $("#drop").textContent = `${file.name} を変換しました。別のPDFに差し替える場合はここにドロップ`;
+    status("");
+  }catch(e){ console.error(e); status("読み込みエラー：" + e.message); }
+}
+
+$("#pick").onclick = ()=> $("#file").click();
+$("#file").onchange = e => handle(e.target.files[0]);
+$("#word").onclick = ()=> exportWord().catch(e=>{ console.error(e); status("Word出力エラー："+e.message); });
+const drop = $("#drop");
+drop.onclick = ()=> $("#file").click();
+["dragenter","dragover"].forEach(ev=>drop.addEventListener(ev,e=>{e.preventDefault();drop.classList.add("over");}));
+["dragleave","drop"].forEach(ev=>drop.addEventListener(ev,e=>{e.preventDefault();drop.classList.remove("over");}));
+drop.addEventListener("drop", e=> handle(e.dataTransfer.files[0]));
+</script>
+</body>
+</html>
