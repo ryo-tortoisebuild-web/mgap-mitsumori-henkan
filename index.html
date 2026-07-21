@@ -236,19 +236,30 @@ function cell(text, opt={}){
   });
 }
 
+// A4縦(11906twips)から左右余白を引いた本文幅。
+// 幅は％ではなく twips の絶対値で指定する（％だとGoogleドキュメント等で列が潰れるため）
+const MARGIN = {top:1000, bottom:1000, left:900, right:900};
+const CONTENT_W = 11906 - MARGIN.left - MARGIN.right;
+const dxa = n => ({size: n, type: D.WidthType.DXA});
+const share = r => Math.round(CONTENT_W * r);
+
 async function exportWord(){
   const d = collect();
-  const pct = n => ({size: n, type: D.WidthType.PERCENTAGE});
 
+  const ovCols = [share(.26), CONTENT_W - share(.26)];
   const ovTable = new D.Table({
-    width: pct(100),
+    width: dxa(CONTENT_W),
+    columnWidths: ovCols,
+    layout: D.TableLayoutType.FIXED,
     rows: d.overview.map(([l,v]) => new D.TableRow({children:[
-      cell(l, {width: pct(26), shade:"F0F3F6", bold:true}),
-      cell(v, {width: pct(74)}),
+      cell(l, {width: dxa(ovCols[0]), shade:"F0F3F6", bold:true}),
+      cell(v, {width: dxa(ovCols[1])}),
     ]})),
   });
 
-  const W = [pct(16), pct(22), pct(38), pct(24)];
+  const cols = [share(.16), share(.22), share(.38)];
+  cols.push(CONTENT_W - cols[0] - cols[1] - cols[2]);   // 端数を最終列で吸収
+  const W = cols.map(dxa);
   const detailRows = [ new D.TableRow({
     tableHeader: true,
     children: ["大項目","小項目","概要・摘要","備考"].map((t,i)=>
@@ -265,13 +276,18 @@ async function exportWord(){
       ]}));
     });
   }
-  const detailTable = new D.Table({width: pct(100), rows: detailRows});
+  const detailTable = new D.Table({
+    width: dxa(CONTENT_W),
+    columnWidths: cols,
+    layout: D.TableLayoutType.FIXED,
+    rows: detailRows,
+  });
 
   const doc = new D.Document({
     styles:{ default:{ document:{ run:{ font: FONT, size: 20 } } } },
     sections:[{
       properties:{ page:{ size:{orientation: D.PageOrientation.PORTRAIT},
-                          margin:{top:1000, bottom:1000, left:900, right:900} } },
+                          margin: MARGIN } },
       children:[
         para("工 事 内 容 概 要 書", {runOpt:{bold:true, size:32}, paraOpt:{alignment: D.AlignmentType.CENTER}}),
         para(d.title, {runOpt:{size:22}, paraOpt:{alignment: D.AlignmentType.CENTER, spacing:{after:300}}}),
